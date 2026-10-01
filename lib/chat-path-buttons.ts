@@ -1,0 +1,523 @@
+/**
+ * A "reveal in the tree" button on every path in a message that actually
+ * exists in this thread's workspace.
+ *
+ * Two things are deliberate here.
+ *
+ * The button is appended *inside* the code element it belongs to. An earlier
+ * version inserted it as a sibling; React re-renders the message subtree and
+ * does not own that button, so old ones were left stranded next to unrelated
+ * text while still carrying their original path. A child is removed together
+ * with its element, so a stale button cannot drift onto another path.
+ *
+ * Which strings get a button is decided by the filesystem, not by a pattern.
+ * `packs/gws` and `and/or` are lexically identical, so guessing either misses
+ * real paths or decorates prose. The candidates go to the server and only the
+ * ones that resolve come back.
+ */
+import { requestReveal } from "./reveal-bus";
+import { writeStoredOpen } from "./rail-state";
+import { createTimedCache, PATH_CACHE_TTL_MS } from "./timed-cache";
+import type { AnchorFix } from "../contract";
+
+const BUTTON_ATTR = "data-file-explorer-reveal";
+const PATH_ATTR = "fileExplorerRevealPath";
+/** Marks a chat link this module answers instead of bb. */
+const FIXED_ATTR = "data-file-explorer-fixed";
+
+// The app chrome uses the same inline elements as rendered Markdown. Restrict
+// mutation to a message container so a workspace folder named "Settings" can
+// never decorate BB's sidebar settings control.
+// BB marks the rendered body of a conversation message with this CSS class.
+// Keep the scanner scoped to that subtree: sidebar/footer controls can contain
+// ordinary text or a `file:` link as well, but must never receive a reveal button.
+const CHAT_MESSAGE_SELECTOR = ".group\\/message";
+
+/** Nodes of `selector` that sit inside a rendered message, not the whole document. */
+function chatQuery<T extends Element>(selector: string): T[] {
+  const found: T[] = [];
+  const messages = document.querySelectorAll(CHAT_MESSAGE_SELECTOR);
+  for (let i = 0; i < messages.length; i += 1) {
+    const message = messages[i];
+    if (message === undefined) continue;
+    const nodes = message.querySelectorAll(selector);
+    for (let j = 0; j < nodes.length; j += 1) {
+      const node = nodes[j];
+      if (node !== undefined) found.push(node as T);
+    }
+  }
+  return found;
+}
+
+/**
+ * A loose shape filter — anything that could plausibly name a file. Unicode
+ * classes rather than `\w`, which is ASCII-only and dropped Cyrillic paths.
+ * The server decides what actually exists; this only keeps obvious prose out
+ * of the batch.
+ */
+const CANDIDATE_RE =
+  /^[~.]?\/?[\p{L}\p{N}_.\-*[\]()][\p{L}\p{N}_.\-*[\]() /]*$/u;
+
+/**
+ * A bare token like `rules` or `packs` is a folder name as often as it is a
+ * word, and only the filesystem can tell. Anything without whitespace is
+ * cheap enough to ask about; prose with spaces is not worth the round trip.
+ */
+const BARE_NAME_RE = /^[\p{L}\p{N}_.\-]{3,}$/u;
+
+const ICON_SVG =
+  '<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 10V7a2 2 0 0 0-2-2h-6l-2-2H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2h5"/><path d="M14 15h8"/><path d="m18 11 4 4-4 4"/></svg>';
+
+/** The element's own text, excluding any button this module added. */
+function textOf(code: Element): string {
+  let text = "";
+  for (const node of Array.from(code.childNodes)) {
+    if (node.nodeType === Node.ELEMENT_NODE) {
+      if ((node as Element).hasAttribute(BUTTON_ATTR)) continue;
+      text += node.textContent ?? "";
+      continue;
+    }
+    text += node.textContent ?? "";
+  }
+  return text.trim();
+}
+
+function candidateOf(code: Element): string | null {
+  const text = textOf(code);
+  if (text.length < 3 || text.length > 512) return null;
+  if (text.includes("/")) return CANDIDATE_RE.test(text) ? text : null;
+  return BARE_NAME_RE.test(text) ? text : null;
+}
+
+function makeButton(path: string): HTMLButtonElement {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.setAttribute(BUTTON_ATTR, "");
+  button.dataset[PATH_ATTR] = path;
+  button.title = `Reveal in the file explorer: ${path}`;
+  button.setAttribute("aria-label", `Reveal in the file explorer: ${path}`);
+  button.innerHTML = ICON_SVG;
+  button.style.cssText = [
+    "display:inline-flex",
+    "align-items:center",
+    "justify-content:center",
+    "vertical-align:text-bottom",
+    "margin-left:4px",
+    "padding:0",
+    "border:0",
+    "background:transparent",
+    "color:currentColor",
+    "opacity:0.55",
+    "cursor:pointer",
+    "line-height:1",
+  ].join(";");
+  return button;
+}
+
+export type PathValidator = (paths: string[]) => Promise<Set<string>>;
+export type AnchorResolver = (
+  anchors: { text: string; href: string }[],
+) => Promise<AnchorFix[]>;
+export type FixedOpener = (fix: AnchorFix) => void;
+export type Reporter = (message: string) => void;
+
+/** BB preview links expose their file target as an absolute or file: href. */
+export function filePathFromHref(href: string): string | null {
+  if (!href.startsWith("file:") && !href.startsWith("/")) return null;
+  try {
+    const url = new URL(href, "file:///");
+    if (url.protocol !== "file:") return null;
+    if (url.host !== "") return null;
+    return decodeURIComponent(url.pathname);
+  } catch {
+    return null;
+  }
+}
+
+function anchorTargetPath(anchor: HTMLAnchorElement): string | null {
+  return filePathFromHref(anchor.getAttribute("href") ?? "");
+}
+
+/** Use BB's rendered preview glyph as the signal, independent of link text. */
+function hasNativePreviewGlyph(anchor: HTMLAnchorElement): boolean {
+  for (const graphic of Array.from(anchor.querySelectorAll("svg, img"))) {
+    if (graphic.closest(`button[${BUTTON_ATTR}]`) === null) return true;
+  }
+  const next = anchor.nextElementSibling;
+  return next !== null && (next.matches("svg, img") || next.querySelector("svg, img") !== null);
+}
+
+function anchorKey(text: string, href: string): string {
+  return `${text}\n${href}`;
+}
+
+/**
+ * Shared across mounts of the same thread. A header re-render aborts the
+ * effect and would otherwise send every path in the chat to the server again.
+ * Each entry expires on its own, so a file created later is asked again
+ * without keeping a miss from the start of the session.
+ */
+const verdictCache = createTimedCache<boolean>(PATH_CACHE_TTL_MS);
+const anchorCache = createTimedCache<AnchorFix | null>(PATH_CACHE_TTL_MS);
+/** One resolve at a time per thread, so a remount waits for the request it aborted. */
+const pathChain = new Map<string, Promise<void>>();
+const anchorChain = new Map<string, Promise<void>>();
+
+function after(chain: Map<string, Promise<void>>, scope: string, job: () => Promise<void>): Promise<void> {
+  const prev = chain.get(scope) ?? Promise.resolve();
+  const next = prev.then(job, job).then(
+    () => undefined,
+    () => undefined,
+  );
+  chain.set(scope, next);
+  return next;
+}
+
+/** Drop local entries whose shared stamp has expired, so a miss does not last the whole mount. */
+function expireLocal<T>(local: Map<string, T>, fresh: Map<string, T>): void {
+  for (const key of local.keys()) {
+    if (!fresh.has(key)) local.delete(key);
+  }
+}
+
+export function mountChatPathButtons(
+  signal: AbortSignal,
+  threadId: string,
+  validate: PathValidator,
+  resolveAnchors: AnchorResolver,
+  openFixed: FixedOpener,
+  report: Reporter = () => undefined,
+): void {
+  /** path → exists in the workspace. Absent means "not asked yet". */
+  const known = verdictCache.recall(threadId);
+  const pending = new Set<string>();
+  let flushTimer: number | null = null;
+  let sweepQueued = false;
+
+  const ensureButton = (code: Element, path: string): void => {
+    const existing = code.querySelector(`button[${BUTTON_ATTR}]`);
+    if (existing !== null) {
+      if ((existing as HTMLElement).dataset[PATH_ATTR] === path) return;
+      existing.remove();
+    }
+    code.appendChild(makeButton(path));
+  };
+
+  /**
+   * key → the file bb's link should have pointed at, or null when bb's own
+   * link is fine (or nothing better exists) and the click stays bb's.
+   */
+  const anchorFixes = anchorCache.recall(threadId);
+  const pendingAnchors = new Map<string, { text: string; href: string }>();
+  let anchorTimer: number | null = null;
+
+  const applyFix = (anchor: HTMLAnchorElement, fix: AnchorFix): void => {
+    anchor.setAttribute(FIXED_ATTR, "");
+    anchor.dataset.fileExplorerFixedPath = fix.absolutePath;
+    anchor.dataset.fileExplorerFixedHost = fix.hostId;
+    anchor.dataset.fileExplorerFixedDir = fix.isDirectory ? "1" : "";
+    anchor.title = fix.absolutePath;
+  };
+
+  const clearFix = (anchor: HTMLAnchorElement): void => {
+    if (!anchor.hasAttribute(FIXED_ATTR)) return;
+    anchor.removeAttribute(FIXED_ATTR);
+    delete anchor.dataset.fileExplorerFixedPath;
+    delete anchor.dataset.fileExplorerFixedHost;
+    delete anchor.dataset.fileExplorerFixedDir;
+  };
+
+  const sweepAnchors = (): void => {
+    expireLocal(anchorFixes, anchorCache.recall(threadId));
+    for (const anchor of chatQuery<HTMLAnchorElement>('a[href^="file:"]')) {
+      const href = anchorTargetPath(anchor);
+      const text = textOf(anchor);
+      if (href === null || text === "") {
+        clearFix(anchor);
+        continue;
+      }
+      const key = anchorKey(text, href);
+      const fix = anchorFixes.get(key);
+      if (fix === undefined) {
+        pendingAnchors.set(key, { text, href });
+        continue;
+      }
+      if (fix === null) clearFix(anchor);
+      else applyFix(anchor, fix);
+    }
+    if (pendingAnchors.size > 0) scheduleAnchorFlush();
+  };
+
+  const scheduleAnchorFlush = (): void => {
+    if (anchorTimer !== null) return;
+    anchorTimer = window.setTimeout(() => {
+      anchorTimer = null;
+      void flushAnchors();
+    }, 400);
+  };
+
+  const flushAnchors = (): void => {
+    const batch = Array.from(pendingAnchors.entries()).slice(0, 100);
+    if (batch.length === 0) return;
+    for (const [key] of batch) pendingAnchors.delete(key);
+    void after(anchorChain, threadId, async () => {
+      const fresh = anchorCache.recall(threadId);
+      for (const [key, fix] of fresh) anchorFixes.set(key, fix);
+      const still = batch.filter(([key]) => !anchorFixes.has(key));
+      if (still.length === 0) return;
+      let fixes: AnchorFix[];
+      try {
+        fixes = await resolveAnchors(still.map(([, anchor]) => anchor));
+      } catch {
+        // Leave them unasked rather than caching a transport failure as "fine".
+        return;
+      }
+      for (const [key] of still) anchorCache.remember(threadId, key, null);
+      for (const fix of fixes) anchorCache.remember(threadId, anchorKey(fix.text, fix.href), fix);
+      if (signal.aborted) return;
+      for (const [key] of still) anchorFixes.set(key, null);
+      for (const fix of fixes) anchorFixes.set(anchorKey(fix.text, fix.href), fix);
+      if (fixes.length > 0) {
+        report(`anchor fixes ${fixes.length}/${batch.length}`);
+      }
+      queueSweep();
+    });
+  };
+
+  let lastReport = "";
+  let sweepTimer: number | null = null;
+  /** A mutation arrived while a sweep was already running or waiting. */
+  let sweepAgain = false;
+  const sweep = (): void => {
+    sweepTimer = null;
+    if (signal.aborted) {
+      sweepQueued = false;
+      sweepAgain = false;
+      return;
+    }
+    expireLocal(known, verdictCache.recall(threadId));
+    let codes = 0;
+    let candidates = 0;
+    let wanted = 0;
+    // Links too, not just code spans: bb renders file mentions as anchors and
+    // gives them its own "open" glyph, which is a different action from
+    // revealing the file in the tree.
+    sweepAnchors();
+    for (const code of chatQuery<Element>("code, a")) {
+      // A `<code>` inside an `<a>` matches twice; let the inner one win so the
+      // path gets one button, not two.
+      const previewPath = code instanceof HTMLAnchorElement && hasNativePreviewGlyph(code)
+        ? anchorTargetPath(code)
+        : null;
+      if (previewPath === null && code.querySelector("code, a") !== null) continue;
+      if (!(code instanceof HTMLAnchorElement) && code.closest("a") !== null &&
+        hasNativePreviewGlyph(code.closest("a") as HTMLAnchorElement)) continue;
+      codes += 1;
+      const path = previewPath ?? candidateOf(code);
+      if (path === null) {
+        code.querySelector(`button[${BUTTON_ATTR}]`)?.remove();
+        continue;
+      }
+      candidates += 1;
+      const verdict = known.get(path);
+      if (verdict === true) {
+        wanted += 1;
+        ensureButton(code, path);
+        continue;
+      }
+      if (verdict === false) continue;
+      pending.add(path);
+    }
+    if (pending.size > 0) scheduleFlush();
+
+    // A live chat mutates constantly, so only report when the numbers that
+    // actually matter move — otherwise this logs once a second forever.
+    const present = document.querySelectorAll(`button[${BUTTON_ATTR}]`).length;
+    const line = `sweep known=${wanted} buttonsInDom=${present}`;
+    if (line !== lastReport) {
+      lastReport = line;
+      report(`${line} (codes=${codes} candidates=${candidates})`);
+    }
+    if (sweepAgain) {
+      sweepAgain = false;
+      // During streaming, coalesce message mutations into at most one full
+      // follow-up scan per 750 ms instead of rescanning every token burst.
+      sweepTimer = window.setTimeout(sweep, 750);
+      return;
+    }
+    sweepQueued = false;
+  };
+
+  const queueSweep = (): void => {
+    if (signal.aborted) return;
+    // Keep the lock until the sweep finishes. Clearing it at the start let
+    // every streaming token schedule another full pass.
+    if (sweepQueued) {
+      sweepAgain = true;
+      return;
+    }
+    sweepQueued = true;
+    sweepTimer = window.setTimeout(sweep, 250);
+  };
+
+  const scheduleFlush = (): void => {
+    if (flushTimer !== null) return;
+    flushTimer = window.setTimeout(() => {
+      flushTimer = null;
+      void flush();
+    }, 400);
+  };
+
+  const flush = (): void => {
+    const batch = Array.from(pending).slice(0, 200);
+    if (batch.length === 0) return;
+    for (const path of batch) pending.delete(path);
+    void after(pathChain, threadId, async () => {
+      const fresh = verdictCache.recall(threadId);
+      for (const [path, exists] of fresh) known.set(path, exists);
+      const still = batch.filter((path) => !known.has(path));
+      if (still.length === 0) return;
+      let resolved: Set<string>;
+      try {
+        resolved = await validate(still);
+      } catch {
+        // Leave them unasked rather than caching a transport failure as "no".
+        return;
+      }
+      for (const path of still) verdictCache.remember(threadId, path, resolved.has(path));
+      if (signal.aborted) return;
+      for (const path of still) known.set(path, resolved.has(path));
+      report(
+        `validated ${still.length}, known ${resolved.size}: ${Array.from(resolved)
+          .slice(0, 5)
+          .join(" | ")}`,
+      );
+      queueSweep();
+    });
+  };
+
+  const buttonFrom = (target: EventTarget | null): HTMLElement | null => {
+    if (target === null || !(target instanceof Element)) return null;
+    return target.closest<HTMLElement>(`button[${BUTTON_ATTR}]`);
+  };
+
+  /**
+   * BB handles file-link clicks with a delegated capture-phase listener, and
+   * the button can sit inside such a link, so claim the event first. Only the
+   * click may call preventDefault(): doing it on pointerdown or mousedown
+   * cancels the click that would otherwise follow.
+   */
+  const fixedAnchorFrom = (target: EventTarget | null): HTMLElement | null => {
+    if (target === null || !(target instanceof Element)) return null;
+    return target.closest<HTMLElement>(`a[${FIXED_ATTR}]`);
+  };
+
+  const onEarly = (event: Event): void => {
+    const button = buttonFrom(event.target);
+    if (button === null) {
+      onFixedAnchor(event);
+      return;
+    }
+    event.stopImmediatePropagation();
+    event.stopPropagation();
+    if (event.type !== "click" && event.type !== "auxclick") return;
+    event.preventDefault();
+    const path = button.dataset[PATH_ATTR];
+    if (path === undefined || path === "") return;
+    writeStoredOpen(true);
+    requestReveal(path, threadId);
+  };
+
+  /**
+   * A link bb pointed at a file that is not there. bb would open a preview of
+   * that missing path, so the click is answered here instead — with the file
+   * the link text actually names.
+   */
+  const onFixedAnchor = (event: Event): void => {
+    const anchor = fixedAnchorFrom(event.target);
+    if (anchor === null) return;
+    const absolutePath = anchor.dataset.fileExplorerFixedPath;
+    const hostId = anchor.dataset.fileExplorerFixedHost;
+    if (absolutePath === undefined || hostId === undefined) return;
+    event.stopImmediatePropagation();
+    event.stopPropagation();
+    if (event.type !== "click" && event.type !== "auxclick") return;
+    event.preventDefault();
+    const isDirectory = anchor.dataset.fileExplorerFixedDir === "1";
+    writeStoredOpen(true);
+    if (isDirectory) {
+      // A folder has no preview; showing it in the tree is the whole action.
+      requestReveal(textOf(anchor), threadId);
+      return;
+    }
+    openFixed({
+      text: textOf(anchor),
+      href: anchor.getAttribute("href") ?? "",
+      absolutePath,
+      hostId,
+      isDirectory,
+    });
+  };
+
+  const opts: AddEventListenerOptions = { capture: true, signal };
+  for (const type of [
+    "pointerdown",
+    "pointerup",
+    "mousedown",
+    "mouseup",
+    "click",
+    "auxclick",
+  ]) {
+    document.addEventListener(type, onEarly, opts);
+  }
+
+  const insideChat = (node: Node): boolean => {
+    const element = node instanceof Element ? node : node.parentElement;
+    if (element === null) return false;
+    return element.closest(CHAT_MESSAGE_SELECTOR) !== null;
+  };
+
+  const containsChat = (node: Node): boolean => {
+    if (!(node instanceof Element)) return false;
+    if (node.matches(CHAT_MESSAGE_SELECTOR)) return true;
+    return node.querySelector(CHAT_MESSAGE_SELECTOR) !== null;
+  };
+
+  const observer = new MutationObserver((records) => {
+    // The tree, toasts, and the composer rewrite the document constantly.
+    // Only a change inside a chat message, or a newly inserted message, can
+    // add a path. Checking the mutation target's whole subtree would match
+    // every body update, because the messages are already in the document.
+    const relevant = records.some(
+      (record) =>
+        insideChat(record.target) ||
+        Array.from(record.addedNodes).some(
+          (node) => insideChat(node) || containsChat(node),
+        ),
+    );
+    if (relevant) queueSweep();
+  });
+  observer.observe(document.body, { childList: true, subtree: true });
+  signal.addEventListener(
+    "abort",
+    () => {
+      observer.disconnect();
+      if (sweepTimer !== null) window.clearTimeout(sweepTimer);
+      if (flushTimer !== null) window.clearTimeout(flushTimer);
+      if (anchorTimer !== null) window.clearTimeout(anchorTimer);
+      for (const button of Array.from(
+        document.querySelectorAll(`button[${BUTTON_ATTR}]`),
+      )) {
+        button.remove();
+      }
+      for (const anchor of Array.from(
+        document.querySelectorAll<HTMLAnchorElement>(`a[${FIXED_ATTR}]`),
+      )) {
+        clearFix(anchor);
+      }
+    },
+    { once: true },
+  );
+
+  queueSweep();
+}
