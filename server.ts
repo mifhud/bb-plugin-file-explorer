@@ -21,8 +21,7 @@ import {
 import { listRootChoices, workspaceForProject, workspaceForThread } from "./src/workspace";
 import {
   replaceInFiles,
-  searchInFiles,
-  type HostSearchFs,
+  type HostFileStore,
 } from "./src/search-in-files";
 
 export { rpcContract } from "./contract";
@@ -40,19 +39,12 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
   };
 
   /**
-   * The host slice the text search walks and reads through. Built per call so
-   * the `hostId` and `rootPath` a root resolved to are what the host confines
-   * every read and write to.
+   * The host slice a replace reads and writes through. Built per call so the
+   * `hostId` and `rootPath` a root resolved to are what the host confines every
+   * read and write to. Search does not come through here: ripgrep runs on the
+   * host, inside the root, and only rows travel back.
    */
-  const hostSearchFs = (hostId: string, rootPath: string): HostSearchFs => ({
-    list: async (absolutePath) => {
-      const listing = await bb.sdk.hosts.directory({ hostId, path: absolutePath });
-      return listing.entries.map((entry) => ({
-        name: entry.name,
-        kind: entry.kind,
-        absolutePath: entry.path,
-      }));
-    },
+  const hostFileStore = (hostId: string, rootPath: string): HostFileStore => ({
     read: async (absolutePath) => {
       const result = await bb.sdk.files.read({ hostId, path: absolutePath, rootPath });
       return {
@@ -216,12 +208,15 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
       if (root === undefined) {
         throw new Error("This file explorer panel is out of date — reopen it and try again.");
       }
-      const result = await searchInFiles(
-        hostSearchFs(root.hostId, root.rootPath),
-        root.rootPath,
-        input,
-        await getIgnoredDirs(),
-      );
+      const result = await host.call("searchInFiles", {
+        rootPath: root.rootPath,
+        query: input.query,
+        matchCase: input.matchCase,
+        wholeWord: input.wholeWord,
+        useRegex: input.useRegex,
+        limit: input.limit,
+        ignoredFolders: [...await getIgnoredDirs()],
+      }, { hostId: root.hostId });
       bb.log.info(
         `searchInFiles ${JSON.stringify(input.query)} -> ${result.matches.length} matches in ${result.filesWithMatches} files`,
       );
@@ -233,7 +228,7 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
         return { ok: false as const, message: "This file explorer panel is out of date — reopen it and try again." };
       }
       const result = await replaceInFiles(
-        hostSearchFs(root.hostId, root.rootPath),
+        hostFileStore(root.hostId, root.rootPath),
         root.rootPath,
         input,
       );

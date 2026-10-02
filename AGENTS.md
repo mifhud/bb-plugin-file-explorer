@@ -10,14 +10,15 @@ The rail carries two tabs — **Files** (name/path search) and **Search text** (
 npm install           # Install dependencies
 bb plugin build       # Build the plugin
 bb plugin reload file-explorer  # Reload plugin in development
+bun test              # Run the unit tests
 ```
 
 ## Architecture
 
 ### Entry Points
 
-- **`server.ts`** — Plugin server entry point. Registers RPC handlers via `rpcContract`. Manages settings, host connection for filesystem operations, search roots, and the ignored-dirs set. Also builds a per-call `hostSearchFs` adapter that bridges BB's host SDK (`bb.sdk.hosts.directory`, `bb.sdk.files.read`, `bb.sdk.files.write`) to the content-search module.
-- **`host.ts`** — Host entry point. Exposes `statPath` and `listDirectory` handlers that run in the host process for filesystem access. Delegates to `statHostPath` and `listHostDirectory` in `src/host-listing.ts`.
+- **`server.ts`** — Plugin server entry point. Registers RPC handlers via `rpcContract`. Manages settings, host connection for filesystem operations, search roots, and the ignored-dirs set. Content search is handed to the host; replace runs here through a per-call `hostFileStore` adapter over BB's host SDK (`bb.sdk.files.read`, `bb.sdk.files.write`).
+- **`host.ts`** — Host entry point. Exposes `statPath`, `listDirectory`, `searchInFiles`, and `removePath` handlers that run in the host process for filesystem access. Delegates to `statHostPath`/`listHostDirectory`/`removeHostPath` in `src/host-listing.ts` and `searchHostInFiles` in `src/host-search.ts`.
 - **`app.tsx`** — Frontend app. Registers UI slots:
   - `experimental_appOverlay` → `GlobalFileExplorerRail` (the persistent right rail)
   - `experimental_threadHeaderAction` → `FileExplorerHeaderAction` (toggle button + chat path bridge)
@@ -28,7 +29,7 @@ bb plugin reload file-explorer  # Reload plugin in development
 ### Contracts
 
 - **`contract.ts`** — Zod-based RPC contract. Defines `DEFAULT_IGNORED_DIRS`, `SKIP_DIR_NAMES`, `SKIP_FILE_NAMES`, all schemas (`treeEntrySchema`, `workspaceSchema`, `rootChoiceSchema`, `workspaceResultSchema`, `revealRootSchema`, `revealResultSchema`, `searchHitSchema`, `fileSearchMatchSchema`, `fileReplaceOutcomeSchema`, `anchorFixSchema`), and the full `rpcContract` with 19 methods.
-- **`host-contract.ts`** — Host-side contract for `statPath` and `listDirectory` calls.
+- **`host-contract.ts`** — Host-side contract for `statPath`, `listDirectory`, `searchInFiles`, and `removePath` calls.
 
 ### Key Source Modules (`src/`)
 
@@ -38,7 +39,8 @@ bb plugin reload file-explorer  # Reload plugin in development
 - **`host-listing.ts`** — Host-side listing. `statHostPath` follows symlinks (rejects only lexical `..`/absolute escapes), `listHostDirectory` lists immediate children with skip patterns and git-ignore annotation.
 - **`roots.ts`** — Root path resolution. Maps opaque server-minted root IDs to `{hostId, rootPath}` pairs. Bounded to 500 entries (oldest-first eviction). Never trusts client-supplied hostId/rootPath for destructive operations.
 - **`workspace.ts`** — Workspace resolution for project sources vs. thread workspaces. Handles personal threads (uses configured `treeRoot` setting) vs. real projects (uses environment checkout path). Exports `workspaceForThread`, `workspaceForProject`, `listRootChoices`.
-- **`search-in-files.ts`** — Content search and replace across files in a pinned root. Walks directories via a `HostSearchFs` interface (injected for testability), bounded by 4000 files, 24 depth, 1MB file size. Uses hash-conditional writes for safe replace. Exports `searchInFiles`, `replaceInFiles`, `HostSearchFs`, `HostSearchEntry`, `HostSearchReadResult`.
+- **`search-in-files.ts`** — Content search walk and replace across files in a pinned root. The walk is the fallback engine (used when ripgrep cannot answer) and the home of the shared line shaping (`matchLine`). Walks directories via `HostSearchReader`, bounded by 4000 files, 24 depth, 1MB file size. Exports `searchInFiles`, `replaceInFiles`, `matchLine`, `HostSearchReader`, `HostFileStore`, `HostSearchFs`, `HostSearchEntry`, `HostSearchRead`, `HostSearchReadResult`, `MAX_FILES`, `MAX_DEPTH`, `MAX_FILE_BYTES`, `BINARY_EXTENSIONS`.
+- **`host-search.ts`** — Host-side text search: runs ripgrep (npm `ripgrep`, WASM) at the pinned root, maps its JSON rows through `matchLine`, falls back to the walk over local `node:fs`. Exports `searchHostInFiles`.
 - **`text-match.ts`** — Regex/text matching utilities for content search. Builds a single global `RegExp` per query (supporting case sensitivity, whole-word, regex). Exports `buildMatcher`, `findMatches`, `countMatches`, `replaceMatches`, `escapeRegExp`, `MatchOptions`.
 - **`create-file.ts`** — Create an empty file from a user-typed name in a given folder. Validates name, checks for collisions, writes via `bb.sdk.files.write`. Returns workspace-relative path.
 - **`create-folder.ts`** — Create a folder from a user-typed name. Validates, checks collisions, writes via `bb.sdk.files.mkdir`.
@@ -151,9 +153,13 @@ When a path lands in another registered project, the tree **re-roots** there rat
 
 ### Content Search & Replace
 
-- `searchInFiles` walks directories (BFS, bounded: 4000 files, 24 depth, 1MB per file), reads files via the host, and returns one match per line with column/length for highlighting
-- Binary extensions refused upfront (`.jpg`, `.png`, `.zip`, etc.)
-- `replaceInFiles` writes each file against the SHA256 it was read at — a changed file is refused, not clobbered
+- `searchInFiles` (RPC) resolves the pinned root and hands the search to the **host** (`host.call("searchInFiles")`), so the files never cross the host bridge and a root on another paired host searches there
+- `src/host-search.ts` runs **ripgrep** (npm `ripgrep`, WASM, bundled into `host.js` — no binary on the host) rooted at the pinned root via a synthetic guest preopen (`GUEST_ROOT`, because a guest `.` resolves against the worker cwd, which is `/`), streaming `--json` rows and stopping collection at `limit`
+- ripgrep is the candidate filter, the JavaScript matcher stays the authority: every line it reports goes through `matchLine` (in `search-in-files.ts`), so highlight, `lineMatches`, and replace agree
+- The run is `--no-ignore --hidden`, plus globs for `ignoredFolders`, `SKIP_FILE_NAMES`, and `BINARY_EXTENSIONS`: a file the tree shows must be a file the search reads
+- Fallback: a pattern the Rust engine refuses (lookaround, say) or a ripgrep run that exits 2 falls back to the walk in `search-in-files.ts` (`searchInFiles`, BFS bounded to 4000 files, 24 depth, 1MB per file) over a local `node:fs` reader
+- Whole-word matching is applied by the JavaScript matcher only — ripgrep returns a superset of candidate lines
+- `replaceInFiles` still runs on the server, reading and writing through `HostFileStore` (`bb.sdk.files`), and writes each file against the SHA256 it was read at — a changed file is refused, not clobbered
 - One global `RegExp` per query (via `buildMatcher` in `text-match.ts`) ensures highlight and replace agree
 
 ### Skip Patterns
@@ -286,7 +292,7 @@ Defined in `server.ts` via `bb.settings.define`:
 
 ## Testing
 
-Tests use `vitest`-style TypeScript imports (`@vitest/expect` or `@vitwhitty/expect` style assertions), but `vitest` is not listed in `package.json` devDependencies and there is no `vitest.config.ts`. Tests live alongside source in `*.test.ts` files, excluded from `tsconfig.json` compilation.
+Tests are `node:test` + `node:assert/strict` TypeScript files living alongside source in `*.test.ts`, excluded from `tsconfig.json` compilation. Run them with `bun test` (Bun resolves the extensionless relative imports; plain `node --test` does not).
 
 |
  
@@ -320,7 +326,8 @@ e
 | `src/rename-entry.test.ts` | Rename with collision and root-protection checks |
 | `src/delete-entry.test.ts` | Delete with recursive folder removal |
 | `src/git-ignore.test.ts` | Git ignore pattern annotation |
-| `src/search-in-files.test.ts` | Content search and replace with hash-conditional writes |
+|`src/search-in-files.test.ts`|Content search and replace with hash-conditional writes|
+|`src/host-search.test.ts`|Host search via ripgrep: line/column mapping, options, ignored folders, binaries, limit, fallback|
 | `src/text-match.test.ts` | Regex/text matching (literal, case, whole-word, regex) |
 | `src/pool.test.ts` | Bounded concurrency mapLimit |
 | `lib/rail-state.test.ts` | Rail open/closed state persistence |

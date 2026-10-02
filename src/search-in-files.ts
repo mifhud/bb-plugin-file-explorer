@@ -4,6 +4,8 @@
  * The tree lists names; this walks the same folders and reads the files. It
  * goes through a small host gateway rather than local `node:fs`, so a project
  * that lives on another paired host searches exactly where the tree browses.
+ * `host-search.ts` is the primary search — ripgrep on the host — and calls the
+ * walk below only when ripgrep cannot answer.
  *
  * Both jobs are bounded on purpose. Search is a dragnet across a working copy
  * — a repo with a `node_modules` in it is millions of lines — so the walk
@@ -31,19 +33,28 @@ export interface HostSearchEntry {
   absolutePath: string;
 }
 
-export interface HostSearchReadResult {
+export interface HostSearchRead {
   content: string;
   contentEncoding: "base64" | "utf8";
-  sha256: string;
   sizeBytes: number;
 }
 
+export interface HostSearchReadResult extends HostSearchRead {
+  sha256: string;
+}
+
 /**
- * The slice of the host SDK this feature needs. Kept as an interface so the
- * walk can be tested against an in-memory tree.
+ * The slice of the host SDK a text search needs. Kept as an interface so the
+ * walk can be tested against an in-memory tree, and so ripgrep-on-the-host can
+ * hand the fallback a reader over local `node:fs`.
  */
-export interface HostSearchFs {
+export interface HostSearchReader {
   list(absolutePath: string): Promise<HostSearchEntry[]>;
+  read(absolutePath: string): Promise<HostSearchRead>;
+}
+
+/** What a replace needs: the file's bytes, the hash they had, and the write back. */
+export interface HostFileStore {
   read(absolutePath: string): Promise<HostSearchReadResult>;
   /** False when the host refused the write because the file changed. */
   write(input: {
@@ -53,6 +64,11 @@ export interface HostSearchFs {
   }): Promise<boolean>;
 }
 
+/** Both faces of one host, which is what the server builds for a pinned root. */
+export interface HostSearchFs extends HostSearchReader, HostFileStore {
+  read(absolutePath: string): Promise<HostSearchReadResult>;
+}
+
 export interface SearchInFilesInput extends MatchOptions {
   query: string;
   limit: number;
@@ -60,8 +76,8 @@ export interface SearchInFilesInput extends MatchOptions {
 
 export interface SearchInFilesResult {
   matches: FileSearchMatch[];
+  /** True when the match budget stopped the run before the tree was exhausted. */
   truncated: boolean;
-  filesScanned: number;
   filesWithMatches: number;
 }
 
@@ -80,11 +96,11 @@ export type ReplaceInFilesResult =
     }
   | { ok: false; message: string };
 
-/** Bounded so one search cannot walk a whole disk. */
-const MAX_FILES = 4000;
-const MAX_DEPTH = 24;
+/** Bounded so one search cannot walk a whole disk. Shared with host ripgrep runs. */
+export const MAX_FILES = 4000;
+export const MAX_DEPTH = 24;
 /** Bigger than any source file worth grepping; skips build artefacts and media. */
-const MAX_FILE_BYTES = 1_000_000;
+export const MAX_FILE_BYTES = 1_000_000;
 /** Long enough for context around a match, short enough for one row. */
 const MAX_LINE_CHARS = 400;
 const LIST_CONCURRENCY = 8;
@@ -96,9 +112,10 @@ const REPLACE_CONCURRENCY = 4;
 /**
  * Extensions whose bytes are never a line of text. The size cap and the NUL
  * check catch the rest, but refusing these up front saves reading an archive
- * or a JPEG to learn the same thing.
+ * or a JPEG to learn the same thing. Shared with the ripgrep run, which skips
+ * them by name rather than by content.
  */
-const BINARY_EXTENSIONS = new Set([
+export const BINARY_EXTENSIONS = new Set([
   "png", "jpg", "jpeg", "gif", "webp", "avif", "bmp", "ico", "icns", "tiff",
   "pdf", "zip", "gz", "tgz", "bz2", "xz", "7z", "rar", "tar",
   "woff", "woff2", "ttf", "otf", "eot",
@@ -127,7 +144,7 @@ interface Candidate {
 
 /** Breadth-first walk collecting the files to scan, bounded by file count. */
 async function collectFiles(
-  fs: HostSearchFs,
+  fs: HostSearchReader,
   rootPath: string,
   ignoredDirs: ReadonlySet<string>,
 ): Promise<{ files: Candidate[]; truncated: boolean }> {
@@ -194,13 +211,39 @@ function clipLine(
   };
 }
 
+/**
+ * One matching line as the panel draws it, or null when the line holds no
+ * match. Shared with the ripgrep path, so a line found by either engine is
+ * painted — and counted — by the same rules.
+ */
+export function matchLine(
+  relativePath: string,
+  lineNumber: number,
+  line: string,
+  matcher: RegExp,
+): FileSearchMatch | null {
+  const found = findMatches(line, matcher);
+  const first = found[0];
+  if (first === undefined) return null;
+  const clipped = clipLine(line, first.column, first.length);
+  return {
+    relativePath,
+    name: basename(relativePath),
+    line: lineNumber,
+    text: clipped.text,
+    column: clipped.column,
+    length: clipped.length,
+    lineMatches: found.length,
+  };
+}
+
 /** Reads one file and returns a row per matching line, or null when skipped. */
 async function scanFile(
-  fs: HostSearchFs,
+  fs: HostSearchReader,
   candidate: Candidate,
   matcher: RegExp,
 ): Promise<FileSearchMatch[] | null> {
-  let read: HostSearchReadResult;
+  let read: HostSearchRead;
   try {
     read = await fs.read(candidate.absolutePath);
   } catch {
@@ -216,26 +259,14 @@ async function scanFile(
   for (let index = 0; index < lines.length; index += 1) {
     const line = lines[index];
     if (line === undefined) continue;
-    const found = findMatches(line, matcher);
-    if (found.length === 0) continue;
-    const first = found[0];
-    if (first === undefined) continue;
-    const clipped = clipLine(line, first.column, first.length);
-    matches.push({
-      relativePath: candidate.relativePath,
-      name: basename(candidate.relativePath),
-      line: index + 1,
-      text: clipped.text,
-      column: clipped.column,
-      length: clipped.length,
-      lineMatches: found.length,
-    });
+    const match = matchLine(candidate.relativePath, index + 1, line, matcher);
+    if (match !== null) matches.push(match);
   }
   return matches;
 }
 
 export async function searchInFiles(
-  fs: HostSearchFs,
+  fs: HostSearchReader,
   rootPath: string,
   input: SearchInFilesInput,
   ignoredDirs: ReadonlySet<string>,
@@ -245,7 +276,6 @@ export async function searchInFiles(
 
   const { files, truncated: walkTruncated } = await collectFiles(fs, rootPath, ignoredDirs);
   const matches: FileSearchMatch[] = [];
-  let filesScanned = 0;
   let truncated = walkTruncated;
 
   for (
@@ -259,8 +289,6 @@ export async function searchInFiles(
     );
     for (const fileMatches of scanned) {
       if (fileMatches === null) continue;
-      filesScanned += 1;
-      if (fileMatches.length === 0) continue;
       for (const match of fileMatches) {
         if (matches.length >= input.limit) {
           truncated = true;
@@ -274,13 +302,12 @@ export async function searchInFiles(
   return {
     matches,
     truncated,
-    filesScanned,
     filesWithMatches: new Set(matches.map((match) => match.relativePath)).size,
   };
 }
 
 export async function replaceInFiles(
-  fs: HostSearchFs,
+  fs: HostFileStore,
   rootPath: string,
   input: ReplaceInFilesInput,
 ): Promise<ReplaceInFilesResult> {

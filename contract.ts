@@ -352,9 +352,8 @@ export const rpcContract = defineRpcContract({
       .strict(),
     output: z.object({
       matches: z.array(fileSearchMatchSchema),
-      /** True when the walk or the match budget stopped the run early. */
+      /** True when the match budget stopped the run before the tree was exhausted. */
       truncated: z.boolean(),
-      filesScanned: z.number().int().nonnegative(),
       filesWithMatches: z.number().int().nonnegative(),
     }),
   },
