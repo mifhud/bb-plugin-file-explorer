@@ -12,6 +12,7 @@ import {
   ContextMenuTrigger,
 } from "@/components/ui/context-menu";
 import { cn } from "@/lib/utils";
+import { OWN_CONTEXT_MENU_ATTR } from "@/lib/native-context-menu";
 import { openWorkspaceFile } from "@/lib/open-preview";
 import { surfaceNavigation } from "@/lib/surface-navigation";
 import {
@@ -287,6 +288,7 @@ function TreeRow({
       <ContextMenu>
         <ContextMenuTrigger asChild>
           <button
+            {...{ [OWN_CONTEXT_MENU_ATTR]: "" }}
             ref={rowRef}
             type="button"
             onClick={onActivate}
@@ -508,6 +510,7 @@ export function FileExplorerBody({ tree }: { tree: TreeModel }) {
         <ContextMenu>
           <ContextMenuTrigger asChild>
             <button
+              {...{ [OWN_CONTEXT_MENU_ATTR]: "" }}
               type="button"
               className="flex items-center gap-1 text-left text-[11px] font-medium text-muted-foreground"
               onClick={() => void tree.reload()}

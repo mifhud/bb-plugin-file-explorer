@@ -56,11 +56,11 @@ bun test              # Run the unit tests
 
 ### Components (`components/`)
 
-- **`GlobalFileExplorerRail.tsx`** — The right-side rail container. Mounted once per BB window (navigation never unmounts it). Manages two tabs (Files/Search text), pinned root selector, rail open/close, resize handle, and refresh button. Persists pinned root and active tab to localStorage.
+- **`GlobalFileExplorerRail.tsx`** — The right-side rail container. Mounted once per BB window (navigation never unmounts it). Manages two tabs (Files/Search text), pinned root selector, rail open/close, resize handle, and refresh button. Persists pinned root and active tab to localStorage. The rail as a whole suppresses the browser's own right-click menu (`native-context-menu.ts`); editable fields and selected text keep it.
 - **`FileExplorerPanel.tsx`** — Tree view container. Combines `FileExplorerSearchBox`/`FileExplorerSearchResults` when searching, otherwise `FileExplorerBody`.
 - **`FileExplorerSearch.tsx`** — Search box (debounced, 280ms, min 2 chars, limit 20) with inline results list. Results sorted with active workspace first. Selecting a result reveals it in the tree via the same path as chat anchors.
 - **`FileContentSearchPanel.tsx`** — Content search panel with query input, replace input, match options (case/whole-word/regex toggles), and replace-all button. Groups matches by file with per-file replace action.
-- **`FileExplorerBody.tsx`** — Tree body rendering. Recursive `TreeRow` component with context menu, git-ignore dimming, twistie expand/collapse, and root-level create/reload controls.
+- **`FileExplorerBody.tsx`** — Tree body rendering. Recursive `TreeRow` component with context menu, git-ignore dimming, twistie expand/collapse, and root-level create/reload controls. Row and root-label buttons carry `OWN_CONTEXT_MENU_ATTR`, which hands their right-clicks to Radix instead of the rail's native-menu guard.
 - **`FileExplorerHeaderAction.tsx`** — Thread header button bundle: `ChatPathBridge` + toggle rail button. Listens for rail open/close events.
 - **`NewThreadFileExplorerAction.tsx`** — New thread composer button (icon: `FileText`). Also registers surface navigation for the null-thread route.
 - **`RailResizeHandle.tsx`** — Drag-to-resize with pointer events. Keyboard accessible (ArrowLeft/ArrowRight, 16px steps). Double-click resets to 216px default.
@@ -79,6 +79,7 @@ bun test              # Run the unit tests
 - **`reveal-bus.ts`** — One-slot hand-off between chat content scripts and the mounted tree. Pending requests are delivered when the tree subscribes.
 - **`search-focus-bus.ts`** — One-slot hand-off for command-palette "find a file" focus requests.
 - **`surface-navigation.ts`** — Registers and resolves `useBbNavigate` per thread route. Keyed by threadId (or "new-thread").
+- **`native-context-menu.ts`** — Suppresses the browser's own right-click menu inside the rail, where the Back/Reload/Inspect list has no business. Menu-owning elements (`OWN_CONTEXT_MENU_ATTR`), editable fields, and non-empty selections keep the native menu; Radix owns its clicks untouched, because a `preventDefault` that lands first would suppress Radix's handler too. Exports `installNativeContextMenuGuard`, `shouldKeepNativeContextMenu`, `OWN_CONTEXT_MENU_ATTR`.
 - **`timed-cache.ts`** — Per-scope TTL cache for verdicts (default 10min for path cache). Used by `chat-path-buttons.ts`.
 - **`file-type.ts`** — Seti-style file glyph and color detection. Maps file names and extensions to glyphs (markdown, json, git, config, react, shell, code, etc.).
 - **`open-preview.ts`** — Opens files in BB's preview panel. Prefers workspace target for environment-rooted files; falls back to host-by-absolute-path for re-rooted or remote files.
@@ -332,6 +333,7 @@ e
 | `src/pool.test.ts` | Bounded concurrency mapLimit |
 | `lib/rail-state.test.ts` | Rail open/closed state persistence |
 | `lib/timed-cache.test.ts` | TTL cache behavior |
+| `lib/native-context-menu.test.ts` | Rail browser-menu suppression: own-menu, editable, and selection exemptions |
 | `lib/surface-navigation.test.ts` | Surface navigation registration |
 | `lib/chat-draft-bus.test.ts` | Chat target registration and path dispatch |
 | `lib/chat-path-buttons.test.ts` | Chat path button DOM scanner and anchor resolution |

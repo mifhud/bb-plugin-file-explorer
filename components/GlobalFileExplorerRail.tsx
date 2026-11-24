@@ -11,6 +11,7 @@ import { SearchableSelect } from "@/components/ui/searchable-select";
 import { cn } from "@/lib/utils";
 import { acquireRailInset, syncRailInset } from "@/lib/rail-inset";
 import { usePortalScopeProps } from "@/lib/portal-scope";
+import { installNativeContextMenuGuard } from "@/lib/native-context-menu";
 import { RAIL_EVENT, initializeRailOpen, writeStoredOpen } from "@/lib/rail-state";
 import { getFindInFolder, subscribeFindInFolder } from "@/lib/find-in-folder";
 import { useRailWidthPx } from "@/lib/rail-width";
@@ -66,6 +67,7 @@ export function GlobalFileExplorerRail() {
   const compact = useIsCompactViewport();
   const railWidthPx = useRailWidthPx();
   const portalScopeProps = usePortalScopeProps();
+  const railRef = useRef<HTMLElement | null>(null);
   const insetHolderId = useRef(`file-explorer:window:${Math.random().toString(36).slice(2)}`).current;
   const initialized = useRef(false);
   const [open, setOpen] = useState(false);
@@ -108,6 +110,15 @@ export function GlobalFileExplorerRail() {
     window.addEventListener(RAIL_EVENT, onRailEvent);
     return () => window.removeEventListener(RAIL_EVENT, onRailEvent);
   }, []);
+
+  // Right-click belongs to the rail: rows carry the plugin's own menus, and
+  // every other pixel of the rail has nothing to offer the browser's Back /
+  // Reload / Inspect list. Editable fields and selected text opt out — see the
+  // guard for why.
+  useEffect(() => {
+    if (!ready) return;
+    return installNativeContextMenuGuard(railRef.current);
+  }, [ready]);
 
   const pinnedThreadId = selectedId?.startsWith("thread:") ? selectedId.slice(7) : null;
   /** The thread the selector last followed, so a manual choice survives re-renders. */
@@ -180,6 +191,7 @@ export function GlobalFileExplorerRail() {
   if (!ready) return null;
   return createPortal(
     <aside
+      ref={railRef}
       {...portalScopeProps}
       className="fixed bottom-0 right-0 top-0 z-40 flex flex-col border-l border-sidebar-border bg-sidebar text-sidebar-foreground"
       style={{ display: railOpen ? "flex" : "none", width: compact ? "100vw" : `${railWidthPx}px` }}
