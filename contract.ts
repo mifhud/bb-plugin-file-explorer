@@ -124,18 +124,6 @@ export const rpcContract = defineRpcContract({
       z.object({ ok: z.literal(false), message: z.string() }),
     ]),
   },
-  copyTextToClipboard: {
-    input: z
-      .object({
-        rootId: z.string().min(1),
-        text: z.string().max(10000),
-      })
-      .strict(),
-    output: z.discriminatedUnion("ok", [
-      z.object({ ok: z.literal(true) }),
-      z.object({ ok: z.literal(false), message: z.string() }),
-    ]),
-  },
   /**
    * Create an empty file with a user-chosen name in the given folder and
    * return its workspace-relative path so the tree can select and open it.

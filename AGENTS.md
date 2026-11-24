@@ -47,7 +47,7 @@ bun test              # Run the unit tests
 - **`create-folder.ts`** — Create a folder from a user-typed name. Validates, checks collisions, writes via `bb.sdk.files.mkdir`.
 - **`rename-entry.ts`** — Rename a file or folder. Validates name, checks collisions, performs `bb.sdk.files.rename`. The tree root is refused.
 - **`delete-entry.ts`** — Delete a file or folder. The tree root is refused. Folders are removed recursively.
-- **`os-actions.ts`** — OS-level actions: `revealInExplorer` (cross-platform: `open -R` on macOS, `explorer /select` on Windows, `xdg-open` on Linux; WSL-aware) and `copyTextToClipboard` (multiple clipboard backends with fallback).
+- **`os-actions.ts`** — OS-level actions that must run on the machine hosting the files: `revealInExplorer` (cross-platform: `open -R` on macOS, `explorer /select` on Windows, `xdg-open` on Linux; WSL-aware).
 - **`ignore.ts`** — Skip patterns. Exports `shouldSkip` (checks `SKIP_FILE_NAMES` / ignored dirs against a `TreeEntry`) and `sortEntries` (directories first, then alphabetical).
 - **`git-ignore.ts`** — Git ignore annotation. Uses `git check-ignore -z --stdin` to determine which files are ignored. Returns null set when git is unavailable.
 - **`entry-name.ts`** — Validates user-typed filenames (bare name, no path separators, not `.`/`..`, not empty).
@@ -81,6 +81,7 @@ bun test              # Run the unit tests
 - **`surface-navigation.ts`** — Registers and resolves `useBbNavigate` per thread route. Keyed by threadId (or "new-thread").
 - **`native-context-menu.ts`** — Suppresses the browser's own right-click menu inside the rail, where the Back/Reload/Inspect list has no business. Menu-owning elements (`OWN_CONTEXT_MENU_ATTR`), editable fields, and non-empty selections keep the native menu; Radix owns its clicks untouched, because a `preventDefault` that lands first would suppress Radix's handler too. Exports `installNativeContextMenuGuard`, `shouldKeepNativeContextMenu`, `OWN_CONTEXT_MENU_ATTR`.
 - **`timed-cache.ts`** — Per-scope TTL cache for verdicts (default 10min for path cache). Used by `chat-path-buttons.ts`.
+- **`clipboard.ts`** — `copyPlainText`: writes to the clipboard of the device showing the rail. Clipboard API first (secure origins); otherwise the editing command with the payload set on the `copy` event, because a menu's focus handling empties the selection that the command would otherwise copy. Chat/tree copy actions must use it — a host-side clipboard would fill the machine running bb, not the user's phone or browser.
 - **`file-type.ts`** — Seti-style file glyph and color detection. Maps file names and extensions to glyphs (markdown, json, git, config, react, shell, code, etc.).
 - **`open-preview.ts`** — Opens files in BB's preview panel. Prefers workspace target for environment-rooted files; falls back to host-by-absolute-path for re-rooted or remote files.
 - **`utils.ts`** — `cn` (clsx + tailwind-merge) and `formatHomePathForDisplay` (abbreviate home paths for display only).
@@ -134,7 +135,7 @@ Three layers of persistence:
 
 - All filesystem operations go through the **host** via `host.call("statPath"/"listDirectory", ...)` or `bb.sdk.hosts.directory`/`bb.sdk.files.*`.
 - Root IDs are server-minted (UUID via `randomUUID`) and map to `{hostId, rootPath}` pairs in a bounded registry (500 entries). Client-supplied rootId, never hostId/rootPath — security: a direct RPC caller cannot point destructive ops at any path.
-- `onThisComputer()` checks if a root is on the primary host before performing OS-level actions (`revealInExplorer`, `copyTextToClipboard`).
+- `onThisComputer()` checks if a root is on the primary host before performing OS-level actions (`revealInExplorer`).
 - `resolveUnderRoot` in `src/paths.ts` provides lexical confinement (`..` rejected) but follows symlinks — a deliberate posture for browsing.
 - `statHostPath` follows symlinks for reveal purposes; `listHostDirectory` follows symlinks in `readdir`/`stat` but skips broken links.
 
@@ -250,7 +251,7 @@ type PathProbe = (
 type SearchRootsGetter = () => Promise<string[]>
 ```
 
-### RPC Contract (19 methods)
+### RPC Contract (18 methods)
 
 
 | Method                | Direction     | Purpose                                                                |
@@ -267,7 +268,6 @@ type SearchRootsGetter = () => Promise<string[]>
 | `clientLog`           | client→server | Forward browser diagnostics to bb.log                                  |
 | `listDir`             | client→server | List directory with skip patterns + caching                            |
 | `revealInExplorer`    | client→server | Open in system file manager (primary host only)                        |
-| `copyTextToClipboard` | client→server | Copy text to system clipboard (primary host only)                      |
 | `createFile`          | client→server | Create empty file, return relative path                                |
 | `createFolder`        | client→server | Create folder, return relative path                                    |
 | `deleteEntry`         | client→server | Delete file or folder (recursive)                                      |
@@ -333,6 +333,7 @@ e
 | `src/pool.test.ts` | Bounded concurrency mapLimit |
 | `lib/rail-state.test.ts` | Rail open/closed state persistence |
 | `lib/timed-cache.test.ts` | TTL cache behavior |
+| `lib/clipboard.test.ts` | Clipboard write: API path, editing-command fallback, failure |
 | `lib/native-context-menu.test.ts` | Rail browser-menu suppression: own-menu, editable, and selection exemptions |
 | `lib/surface-navigation.test.ts` | Surface navigation registration |
 | `lib/chat-draft-bus.test.ts` | Chat target registration and path dispatch |

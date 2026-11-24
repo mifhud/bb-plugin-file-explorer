@@ -6,7 +6,7 @@ import { createFile } from "./src/create-file";
 import { createFolder } from "./src/create-folder";
 import { deleteEntry } from "./src/delete-entry";
 import { renameEntry } from "./src/rename-entry";
-import { copyTextToClipboard, revealInExplorer } from "./src/os-actions";
+import { revealInExplorer } from "./src/os-actions";
 import { resolveRoot } from "./src/roots";
 import { invalidateListings, listDir } from "./src/listing";
 import {
@@ -178,10 +178,6 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
     revealInExplorer: async (input) => {
       if (!await onThisComputer(input.rootId)) return { ok: false, message: "This file is on another computer." };
       return revealInExplorer(input);
-    },
-    copyTextToClipboard: async (input) => {
-      if (!await onThisComputer(input.rootId)) return { ok: false, message: "This file is on another computer." };
-      return copyTextToClipboard(input.text);
     },
     createFile: async (input) => {
       const result = await createFile(bb, host, input);

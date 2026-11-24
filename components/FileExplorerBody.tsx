@@ -1,6 +1,5 @@
 import { useEffect, useRef, useSyncExternalStore } from "react";
 import { useBbContext, useBbNavigate, useRpc } from "@get-bb/plugin-sdk/app";
-import type { PluginRpcClient } from "@get-bb/plugin-sdk/app";
 import { toast } from "sonner";
 import { FileTypeIcon } from "@/components/FileTypeIcon";
 import { Icon } from "@/components/ui/icon";
@@ -14,6 +13,7 @@ import {
 import { cn } from "@/lib/utils";
 import { OWN_CONTEXT_MENU_ATTR } from "@/lib/native-context-menu";
 import { openWorkspaceFile } from "@/lib/open-preview";
+import { copyPlainText } from "@/lib/clipboard";
 import { surfaceNavigation } from "@/lib/surface-navigation";
 import {
   getChatTargets,
@@ -33,24 +33,12 @@ function absolutePathOf(workspace: Workspace, relativePath: string): string {
   return relativePath === "" ? root : `${root}/${relativePath}`;
 }
 
-function makeCopyPathToClipboard(
-  rpc: PluginRpcClient<typeof rpcContract>,
-  workspace: Workspace,
-) {
-  return (text: string, successMessage: string): void => {
-    void rpc
-      .call("copyTextToClipboard", {
-        rootId: workspace.rootId,
-        text,
-      })
-      .then((result) => {
-        if (result.ok) toast.success(successMessage);
-        else toast.error(result.message);
-      })
-      .catch(() => {
-        toast.error("Could not copy to the clipboard.");
-      });
-  };
+/** Copy text into the clipboard of the device showing the rail. */
+function copyPathToClipboard(text: string, successMessage: string): void {
+  void copyPlainText(text).then((copied) => {
+    if (copied) toast.success(successMessage);
+    else toast.error("Could not copy to the clipboard.");
+  });
 }
 
 /** Folder a new file should land in: the row itself if it is a folder, else its parent. */
@@ -200,8 +188,6 @@ function TreeRow({
         toast.error("Could not open in Explorer.");
       });
   };
-
-  const copyPathToClipboard = makeCopyPathToClipboard(rpc, workspace);
 
   const createFile = () => {
     const name = window.prompt("File name:");
@@ -452,8 +438,6 @@ export function FileExplorerBody({ tree }: { tree: TreeModel }) {
       </p>
     );
   }
-
-  const copyPathToClipboard = makeCopyPathToClipboard(rpc, workspace);
 
   const createFileInRoot = () => {
     const name = window.prompt("File name:");
