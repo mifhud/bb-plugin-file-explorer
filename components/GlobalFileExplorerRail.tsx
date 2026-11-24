@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } from "react";
 import { createPortal } from "react-dom";
 import { useBbContext, useRpc, useSettings } from "@get-bb/plugin-sdk/app";
 import { Button } from "@/components/ui/button";
@@ -74,6 +74,12 @@ export function GlobalFileExplorerRail() {
   const [choices, setChoices] = useState<RootChoice[]>([]);
   const [loadingRoots, setLoadingRoots] = useState(true);
   const [rootError, setRootError] = useState<string | null>(null);
+  /** A transient blip (a gateway 502 while bb restarts) must not pin a red line
+   *  to the rail for the rest of the session: every load clears it, and a
+   *  dismiss leaves the selector working. */
+  const dismissRootError = useCallback((): void => {
+    setRootError(null);
+  }, []);
   const [refreshCount, setRefreshCount] = useState(0);
   const [tab, setTab] = useState<ExplorerTab>(readStoredTab);
 
@@ -109,10 +115,12 @@ export function GlobalFileExplorerRail() {
   useEffect(() => {
     let cancelled = false;
     setLoadingRoots(true);
+    setRootError(null);
     void rpc.call("listRootChoices", { currentThreadId: threadId, pinnedThreadId })
       .then(({ choices: next }) => {
         if (cancelled) return;
         setChoices(next);
+        setRootError(null);
         // Opening a thread shows that thread's own project: the selector
         // follows the route. The pinned choice is what New Thread keeps —
         // there is no thread there to follow.
@@ -150,6 +158,14 @@ export function GlobalFileExplorerRail() {
       });
     return () => { cancelled = true; };
   }, [rpc, threadId, projectId, pinnedThreadId, selectedId, refreshCount, values?.treeRoot]);
+
+  // A message the user did not dismiss still expires, so a one-off failure never
+  // outlives the moment that caused it.
+  useEffect(() => {
+    if (rootError === null) return;
+    const timer = window.setTimeout(dismissRootError, 60_000);
+    return () => window.clearTimeout(timer);
+  }, [rootError, dismissRootError]);
 
   const chosen = choices.find((choice) => choice.id === selectedId);
   const railOpen = ready && open;
@@ -232,7 +248,19 @@ export function GlobalFileExplorerRail() {
           </button>
         ))}
       </div>
-      {rootError !== null ? <p className="px-2 py-2 text-[11px] text-destructive">{rootError}</p> : null}
+      {rootError !== null ? (
+        <div className="flex shrink-0 items-start justify-between gap-2 border-b border-sidebar-border bg-destructive/10 px-2 py-1.5">
+          <p className="min-w-0 text-[11px] text-destructive">{rootError}</p>
+          <button
+            type="button"
+            aria-label="Dismiss error"
+            className="shrink-0 text-muted-foreground hover:text-foreground"
+            onClick={dismissRootError}
+          >
+            <Icon name="X" className="size-3" />
+          </button>
+        </div>
+      ) : null}
       {loadingRoots && choices.length === 0 ? <p className="px-2 py-2 text-[11px] text-muted-foreground">Loading folders…</p> : null}
       {tab === "files" ? (
         <FileExplorerPanel root={chosen?.workspace ?? null} />
