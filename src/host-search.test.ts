@@ -134,8 +134,15 @@ test("include and exclude globs are passed to ripgrep and respected", async () =
     "tests/a.test.ts": "foo\n",
   });
   try {
+    // A bare name matches at any depth; a slash makes the glob root-relative.
     const onlyTs = await search(root, { query: "foo", include: "*.ts" });
-    assert.deepEqual(onlyTs.rows.sort(), ["src/a.ts:1:0:1", "src/b.ts:1:0:1"]);
+    assert.deepEqual(onlyTs.rows.sort(), [
+      "src/a.ts:1:0:1",
+      "src/b.ts:1:0:1",
+      "tests/a.test.ts:1:0:1",
+    ]);
+    const srcOnly = await search(root, { query: "foo", include: "src/*.ts" });
+    assert.deepEqual(srcOnly.rows.sort(), ["src/a.ts:1:0:1", "src/b.ts:1:0:1"]);
     const noTests = await search(root, { query: "foo", exclude: "**/*.test.ts" });
     assert.deepEqual(noTests.rows.sort(), ["src/a.ts:1:0:1", "src/b.ts:1:0:1", "src/c.txt:1:0:1"]);
     const noTests2 = await search(root, { query: "foo", exclude: "tests" });

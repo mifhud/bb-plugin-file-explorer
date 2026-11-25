@@ -33,7 +33,7 @@ import {
   type SearchInFilesInput,
   type SearchInFilesResult,
 } from "./search-in-files";
-import { parseGlobs } from "./glob-match";
+import { anyGlobMatches, compileGlob, parseGlobs } from "./glob-match";
 import { buildMatcher } from "./text-match";
 
 /** The fields this walk reads out of ripgrep's JSON-lines output. */
@@ -54,6 +54,17 @@ function escapeGlob(name: string): string {
   return name.replace(/[\\*?[\]{}!]/gu, (character) => `\\${character}`);
 }
 
+/**
+ * The include and exclude fields are root-relative globs, but ripgrep matches
+ * a glob containing a slash against the absolute path it was handed. Anchor
+ * those at the guest root so `src/**` means the same thing here and in the
+ * fallback walk; a bare name stays a name and matches at any depth.
+ */
+function rootGlob(glob: string): string {
+  const trimmed = glob.startsWith("/") ? glob.slice(1) : glob;
+  return trimmed.includes("/") ? `${GUEST_ROOT}/${trimmed}` : trimmed;
+}
+
 function ripgrepArgs(
   input: SearchInFilesInput,
   ignoredDirs: ReadonlySet<string>,
@@ -70,8 +81,8 @@ function ripgrepArgs(
   for (const name of ignoredDirs) args.push("--glob", `!${escapeGlob(name)}`);
   // The panel's include and exclude fields are globs as typed, so they reach
   // ripgrep unescaped; the JavaScript matcher stays the authority either way.
-  for (const glob of parseGlobs(input.include ?? "")) args.push("--glob", glob);
-  for (const glob of parseGlobs(input.exclude ?? "")) args.push("--glob", `!${glob}`);
+  for (const glob of parseGlobs(input.include ?? "")) args.push("--glob", rootGlob(glob));
+  for (const glob of parseGlobs(input.exclude ?? "")) args.push("--glob", `!${rootGlob(glob)}`);
   for (const name of Object.keys(SKIP_FILE_NAMES)) args.push("--glob", `!${escapeGlob(name)}`);
   // ripgrep calls a file binary when its first bytes say so — a short file
   // whose bytes happen to be printable is still a picture, so the same
@@ -154,6 +165,15 @@ async function scanWithRipgrep(
 ): Promise<SearchInFilesResult | null> {
   const matches: FileSearchMatch[] = [];
   const decoder = new TextDecoder();
+  const includePatterns = parseGlobs(input.include ?? "").map(compileGlob);
+  const excludePatterns = parseGlobs(input.exclude ?? "").map(compileGlob);
+  // ripgrep prunes with the same globs, but the JavaScript matcher is the
+  // authority: a row it would not accept must not reach the panel.
+  const inScope = (relativePath: string): boolean => {
+    if (includePatterns.length > 0 && !anyGlobMatches(includePatterns, relativePath)) return false;
+    if (excludePatterns.length > 0 && anyGlobMatches(excludePatterns, relativePath)) return false;
+    return true;
+  };
   let pending = "";
   let truncated = false;
 
@@ -170,7 +190,7 @@ async function scanWithRipgrep(
     const lineNumber = event.data?.line_number;
     if (pathText === undefined || lineText === undefined || lineNumber === undefined) return;
     const relativePath = relativeFromRipgrep(pathText);
-    if (relativePath === null) return;
+    if (relativePath === null || !inScope(relativePath)) return;
     // Every event carries one line; the trailing newline is not part of it.
     const match = matchLine(relativePath, lineNumber, lineText.replace(/\r?\n$/u, ""), matcher);
     if (match === null) return;
